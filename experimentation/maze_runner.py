@@ -68,17 +68,25 @@ def read_on_tape(px, reference):
 
 
 def follow_steer(on_tape, last_steer):
-    """Steering angle for normal line-following from the on-tape booleans."""
+    """Steering angle for normal line-following from the on-tape booleans.
+
+    Signs and forward-priority are copied from light_line_tracking.py, which
+    tracks our white line reliably on this robot. The servo sign is
+    calibration-dependent (see docs/picar-api.md), so we trust the file that
+    empirically works rather than re-derive it — the previous version steered
+    the opposite way. Forward-priority: as long as the MID sensor sees the line
+    we go straight, and only correct once the line has slipped to an outer
+    sensor. That's far less twitchy than correcting whenever an outer sensor is
+    also on.
+    """
     left, mid, right = on_tape
-    if mid and not left and not right:
-        return 0                       # centred
-    if left and not right:
-        return STEER_OFFSET            # tape to the left -> steer left
-    if right and not left:
-        return -STEER_OFFSET           # tape to the right -> steer right
-    if not any(on_tape):
-        return last_steer              # lost the line -> keep last correction (recovery)
-    return 0                           # ambiguous (e.g. [T,T,T]) -> hold straight
+    if mid:
+        return 0                       # line under centre -> straight
+    if left:
+        return -STEER_OFFSET           # line slipped to the left sensor -> steer toward it
+    if right:
+        return STEER_OFFSET            # line slipped to the right sensor -> steer toward it
+    return last_steer                  # line lost -> hold last correction
 
 
 def main():
