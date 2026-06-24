@@ -2,67 +2,78 @@
 """Adaptive grayscale line detection for a varying / low-contrast surface.
 
 A fixed threshold (`value > reference`) fails on this maze: the floor brightness
-drifts from area to area, and in some places tape-vs-floor contrast is low. So we
-decide "on tape" from CONTRAST measured in real time, not absolute values.
+drifts area to area. But the TAPE reads consistently (~1000 in testing), so we
+anchor to that and only track the moving part — the floor:
 
-How it works
-------------
-* Each cycle we sample the background ("floor") as ``min(data)`` — at any moment
-  at least one of the three sensors is usually over plain floor, so the darkest
-  reading is a good floor estimate. (We use a SHARED floor, not per-sensor,
-  because the centre sensor sits on the line most of the time and a per-sensor
-  baseline would wrongly learn the line as "background".)
-* The floor estimate is smoothed asymmetrically: it drops FAST toward darker
-  readings (chase a darkening surface) and rises SLOWLY (so a brief bright
-  crossbar / junction can't drag the floor up and blind us).
-* ``signal[i] = reading[i] - floor`` is how far each sensor stands above floor.
-* A sensor is "on tape" when its signal clears BOTH a small absolute noise gate
-  (``min_contrast``) AND a fraction of the strongest sensor's signal (``frac``).
-  The relative part is what makes it work in low-contrast patches.
+    threshold = floor + max(min_contrast, frac * (tape_level - floor))
 
-This handles: surface drift (floor follows it), brief junctions (slow rise keeps
-the floor put), and low contrast (relative threshold with only a small absolute
-floor). It deliberately knows nothing about junctions — callers interpret the
+With frac=0.5 that's the midpoint between the current floor and the tape level.
+A sensor on tape (~1000) sits far above it; the floor and its background wobble
+sit far below it; so small background variation can't be mistaken for tape.
+
+Tracking the floor:
+    Each cycle the floor sample is the darkest sensor whose reading is BELOW the
+    current threshold (i.e. not "on tape"). The centre sensor sitting on the line
+    is above the threshold and so is ignored — the off-line sensors supply the
+    background — and the floor estimate stays correct even on long straights and
+    even as the floor brightens (it can always track up to just under the
+    threshold, so it never stalls). It drops FAST toward darker readings and
+    rises a bit slower toward brighter ones. When all sensors are on tape (a
+    crossbar) there is no sub-threshold sample, so the floor simply holds.
+
+The detector knows nothing about junctions — callers interpret the
 [left, mid, right] booleans (e.g. "both outer on tape" == junction).
 """
 
 
 class AdaptiveLine:
-    def __init__(self, floor_drop=0.3, floor_rise=0.01, min_contrast=30, frac=0.5):
-        """All knobs are in raw ADC counts / fractions; tune on the real maze.
+    def __init__(self, tape_level=1000, frac=0.5, min_contrast=40,
+                 floor_drop=0.3, floor_rise=0.1):
+        """Knobs are in raw ADC counts / fractions; tune on the real maze.
 
-        floor_drop   : EMA rate when the new floor sample is DARKER (fast, 0..1).
-        floor_rise   : EMA rate when it is BRIGHTER (slow — resist bright tape).
-        min_contrast : ADC counts a sensor must exceed the floor by to count at
-                       all. Set just above sensor noise; lower = more sensitive in
-                       low-contrast areas, but noisier.
-        frac         : a sensor is "on" if its signal >= frac * strongest signal.
+        tape_level   : the (consistent) tape reading, ~1000 here.
+        frac         : threshold sits frac of the way from floor up to tape_level.
+        min_contrast : absolute minimum gap above the floor (ADC counts), so very
+                       low contrast still needs a real margin to trip.
+        floor_drop   : EMA rate chasing a DARKER floor (fast, 0..1).
+        floor_rise   : EMA rate tracking a BRIGHTER floor.
         """
-        self.floor = None
+        self.tape_level = float(tape_level)
+        self.frac = frac
+        self.min_contrast = min_contrast
         self.floor_drop = floor_drop
         self.floor_rise = floor_rise
-        self.min_contrast = min_contrast
-        self.frac = frac
+        self.floor = None
+
+    def seed_floor(self, samples):
+        """Seed the floor from startup readings: the darkest value seen."""
+        vals = [v for row in samples for v in row]
+        if vals:
+            self.floor = float(min(vals))
+
+    def threshold(self):
+        f = self.floor if self.floor is not None else 0.0
+        return f + max(self.min_contrast, self.frac * (self.tape_level - f))
 
     def update(self, data):
         """Feed one [left, mid, right] reading.
 
-        Returns (on_tape, signal, floor):
-            on_tape : [bool, bool, bool]  — which sensors see tape
-            signal  : [float, float, float] — each sensor's level above floor
-            floor   : float — current adaptive background estimate
+        Returns (on_tape, threshold, floor):
+            on_tape   : [bool, bool, bool] — which sensors see tape
+            threshold : float — current on-threshold
+            floor     : float — current background estimate
         """
-        sample = min(data)
-        if self.floor is None:
-            self.floor = float(sample)
-        rate = self.floor_drop if sample < self.floor else self.floor_rise
-        self.floor += rate * (sample - self.floor)
+        if self.floor is None:                       # seed from first frame
+            self.floor = float(min(data))
 
-        signal = [max(0.0, v - self.floor) for v in data]
-        peak = max(signal)
-        if peak < self.min_contrast:
-            on_tape = [False, False, False]          # nothing stands out -> lost / all floor
-        else:
-            thresh = max(self.min_contrast, self.frac * peak)
-            on_tape = [s >= thresh for s in signal]
-        return on_tape, signal, self.floor
+        thr = self.threshold()
+        on = [v >= thr for v in data]
+
+        # Track the floor from the darkest sub-threshold (off-line) sensor.
+        bg = [v for v in data if v < thr]
+        if bg:
+            sample = min(bg)
+            rate = self.floor_drop if sample < self.floor else self.floor_rise
+            self.floor += rate * (sample - self.floor)
+
+        return on, thr, self.floor

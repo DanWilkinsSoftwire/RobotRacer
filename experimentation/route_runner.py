@@ -56,6 +56,9 @@ MIN_UTURN_S = 1.2          # a 180 takes longer; don't finish early
 MAX_UTURN_S = 4.0
 COOLDOWN_S = 1.0           # after handling a junction, ignore junctions briefly
                            # (also carries a "straight" across the crossbar)
+SEED_S = 0.5               # sit still this long at startup to seed the floor estimate
+JUNCTION_FRAMES = 3        # require both-outer-on-tape for this many consecutive
+                           # cycles before acting — debounces single-frame glitches
 
 # Single-letter route actions, e.g. "LLFRLF".
 ACTION_BY_CHAR = {
@@ -128,9 +131,23 @@ def main():
 
     px = Picarx()
     detector = AdaptiveLine(
-        min_contrast=CONFIG.get("adaptive_min_contrast", 30),
+        tape_level=CONFIG.get("tape_level", 1000),
         frac=CONFIG.get("adaptive_frac", 0.5),
+        min_contrast=CONFIG.get("adaptive_min_contrast", 40),
     )
+
+    # Seed the floor by sampling for a moment while stationary. The off-line
+    # sensors supply the background, so the threshold is right before we move.
+    print("Seeding floor (hold still)...")
+    seed = []
+    t0 = monotonic()
+    while monotonic() - t0 < SEED_S:
+        seed.append(px.get_grayscale_data())
+        sleep(0.02)
+    detector.seed_floor(seed)
+    print("  floor=%s  threshold=%.0f  (tape~%.0f)"
+          % (None if detector.floor is None else round(detector.floor),
+             detector.threshold(), detector.tape_level))
 
     period = 1.0 / FOLLOW_HZ
     mode = "follow"            # "follow" | "turn"
@@ -139,7 +156,8 @@ def main():
     last_steer = 0
     turn_start = 0.0
     cooldown_until = 0.0
-    j = 0                      # next ROUTE index (also the junction count)
+    junction_frames = 0       # consecutive both-outer-on-tape cycles (debounce)
+    j = 0                     # next ROUTE index (also the junction count)
 
     print("Route runner: %d planned junctions %s. Ctrl+C to stop.\n"
           % (len(route), route))
@@ -148,14 +166,15 @@ def main():
         while True:
             now = monotonic()
             data = px.get_grayscale_data()
-            on_tape, signal, floor = detector.update(data)
+            on_tape, thr, floor = detector.update(data)
 
             if mode == "follow":
-                at_junction = on_tape[0] and on_tape[2]
-                if at_junction and now >= cooldown_until:
+                junction_frames = junction_frames + 1 if (on_tape[0] and on_tape[2]) else 0
+                if junction_frames >= JUNCTION_FRAMES and now >= cooldown_until:
+                    junction_frames = 0
                     action = route[j] if j < len(route) else "stop"
-                    print("-> junction %d: %-8s data=%s on=%s floor=%.0f"
-                          % (j, action, data, on_tape, floor))
+                    print("-> junction %d: %-8s data=%s on=%s thr=%.0f floor=%.0f"
+                          % (j, action, data, on_tape, thr, floor))
                     j += 1
 
                     if action == "stop":
