@@ -44,6 +44,9 @@ FOLLOW_HZ = 50                 # control loop rate
 DRIVE_POWER = CONFIG["drive_power"]
 STEER_OFFSET = CONFIG["steer_offset"]   # gentle correction while following
 TURN_ANGLE = 30                # sharp steer for a committed junction turn ([-30,30], + = left)
+CAM_TILT_ANGLE = -30           # tilt camera DOWN at the floor ([-35,65], negative = down).
+                               # Keeps the view on near floor/tape, not the distant horizon,
+                               # so we stop reading clutter as junctions.
 MIN_TURN_S = 0.4               # don't declare the turn "done" before this
 MAX_TURN_S = 2.5               # give up turning after this (avoid spinning forever)
 COOLDOWN_S = 1.0               # after a turn, ignore junctions briefly so we don't re-fire
@@ -82,6 +85,8 @@ def main():
     px = Picarx()
     reference = CONFIG["line_reference"]
     px.set_line_reference(reference)
+    px.set_cam_pan_angle(0)
+    px.set_cam_tilt_angle(CAM_TILT_ANGLE)   # look down at the floor in front
 
     Vilib.camera_start(vflip=False, hflip=False)
     Vilib.display(local=False, web=True)   # watch at http://<robot-ip>:9000/mjpg
