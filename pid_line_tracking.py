@@ -85,7 +85,7 @@ def main():
                 
                 # Keep moving slowly with last known steering angle to try to find the line
                 px.forward(max(1, base_speed // 2))
-                sleep(period)
+                time.sleep(period)
                 continue
             else:
                 lost_start_time = None
