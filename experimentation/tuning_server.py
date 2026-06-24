@@ -31,8 +31,9 @@ PORT = 9002
 # Slider metadata. `key` must match a config.json key. The follower only reads
 # drive_power (speed) and steer_offset (turning), so those are the only knobs.
 PARAMS = [
-    {"key": "drive_power",  "label": "Drive power",        "min": 0, "max": 100, "step": 1, "cast": "int", "group": "Speed"},
-    {"key": "steer_offset", "label": "Steer offset (deg)", "min": 0, "max": 30,  "step": 1, "cast": "int", "group": "Turning"},
+    {"key": "drive_power",  "label": "Drive power",          "min": 0,  "max": 100, "step": 1,    "cast": "int",   "group": "Speed"},
+    {"key": "speed_scale",  "label": "Corner slowdown (0-1)", "min": 0.0, "max": 1.0, "step": 0.05, "cast": "float", "group": "Speed"},
+    {"key": "steer_offset", "label": "Steer offset (deg)",   "min": 0,  "max": 30,  "step": 1,    "cast": "int",   "group": "Turning"},
 ]
 _SPEC = {p["key"]: p for p in PARAMS}
 _CAST = {"int": int, "float": float}

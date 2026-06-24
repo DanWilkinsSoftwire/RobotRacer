@@ -94,6 +94,10 @@ if __name__=='__main__':
             cfg = live_config()              # picks up slider changes
             power = cfg["drive_power"]
             offset = cfg["steer_offset"]
+            # Corner speed: full power on straights, slowed while correcting.
+            # Mirrors the PID follower's speed = base * (1 - speed_scale*error),
+            # with error = 0 (centred) or 1 (off to a side) for bang-bang.
+            corner_power = max(1, round(power * (1.0 - cfg["speed_scale"])))
 
             gm_val_list = px.get_grayscale_data()
             gm_state = get_status(gm_val_list)
@@ -107,10 +111,10 @@ if __name__=='__main__':
                 px.forward(power)
             elif gm_state == 'left':
                 px.set_dir_servo_angle(offset)
-                px.forward(power)
+                px.forward(corner_power)
             elif gm_state == 'right':
                 px.set_dir_servo_angle(-offset)
-                px.forward(power)
+                px.forward(corner_power)
             else:
                 outHandle()
 
