@@ -26,7 +26,7 @@ from threading import Thread
 import os
 
 from vilib import Vilib
-from picarx import Picarx
+from robot_hat import ADC
 import readchar
 from flask import Flask, jsonify, Response
 
@@ -40,9 +40,14 @@ except Exception:
 ADC_MAX = 4095
 DEBUG_PORT = 9001
 CAM_PORT = 9000  # Vilib's MJPEG port
+GRAYSCALE_PINS = ["A0", "A1", "A2"]  # Picarx grayscale defaults (left, mid, right)
 
-px = Picarx()
-px.set_line_reference(LINE_REFERENCE)
+# Read the grayscale sensors via the ADC directly rather than constructing a
+# Picarx. A Picarx() claims the motor/servo GPIO pins, which (a) collides with a
+# driving program ("GPIO busy") and (b) is unnecessary for a read-only debug
+# view. Talking to the ADC over I2C lets this dashboard run *alongside* the
+# line-follower so you can watch the sensors while the robot drives.
+adcs = [ADC(pin) for pin in GRAYSCALE_PINS]
 
 manual = '''
 Live camera:      http://<robot-ip>:%d/mjpg
@@ -61,33 +66,25 @@ Press keys to control recording:
 app = Flask(__name__)
 
 
+SENSOR_LABELS = ["Left", "Mid", "Right"]
+
+
 def read_sensors():
     """Return current sensor state, swallowing transient read errors."""
     try:
-        data = px.get_grayscale_data()  # [A0, A1, A2]
+        data = [adc.read() for adc in adcs]  # [A0, A1, A2] = left, mid, right
     except Exception as e:
         return {"error": str(e)}
 
-    # The library's interpretation. NOTE: get_line_status assumes a DARK line on
-    # a LIGHT background, which is inverted from our white-tape-on-dark-floor
-    # maze, so trust the raw values + "over reference" more than this label.
-    try:
-        line_status = px.get_line_status(data)  # [l, m, r], 0=line 1=background
-    except Exception:
-        line_status = None
-
-    try:
-        distance = round(px.get_distance(), 1)
-    except Exception:
-        distance = None
+    # White tape reads brighter than the dark floor, so "over reference" == tape.
+    over = [int(v) > int(r) for v, r in zip(data, LINE_REFERENCE)]
+    tape = [SENSOR_LABELS[i] for i, o in enumerate(over) if o]
 
     return {
-        "data": list(data),
+        "data": data,
         "reference": LINE_REFERENCE,
-        # True where the sensor reads brighter than its threshold (i.e. white tape)
-        "over_reference": [int(v) > int(r) for v, r in zip(data, LINE_REFERENCE)],
-        "line_status": line_status,
-        "distance": distance,
+        "over_reference": over,
+        "tape": tape,  # which sensors currently see white tape
         "adc_max": ADC_MAX,
     }
 
@@ -149,8 +146,7 @@ DASHBOARD_HTML = """<!doctype html>
       <div class="meta">
         <div>Reference: <code id="ref">--</code>
           (green = over threshold &rarr; white tape)</div>
-        <div>Library line_status: <code id="ls">--</code></div>
-        <div>Distance: <b id="dist">--</b> cm</div>
+        <div>Tape detected under: <b id="tape">--</b></div>
         <div id="err" style="color:#ff5277"></div>
       </div>
     </div>
@@ -178,10 +174,8 @@ DASHBOARD_HTML = """<!doctype html>
         document.getElementById('v' + i).textContent = v;
       }
       document.getElementById('ref').textContent = '[' + d.reference.join(', ') + ']';
-      document.getElementById('ls').textContent =
-          d.line_status ? JSON.stringify(d.line_status) : 'n/a';
-      document.getElementById('dist').textContent =
-          (d.distance === null ? '--' : d.distance);
+      document.getElementById('tape').textContent =
+          d.tape.length ? d.tape.join(', ') : 'none';
     } catch (e) { /* keep polling */ }
   }
   setInterval(poll, 120);
