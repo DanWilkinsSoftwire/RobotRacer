@@ -92,6 +92,11 @@ def main():
     Vilib.display(local=False, web=True)   # watch at http://<robot-ip>:9000/mjpg
     sleep(0.8)
 
+    # Set camera angle AFTER Vilib startup — Vilib re-inits the PWM board, which
+    # snaps servos back to neutral, so an earlier tilt would just flick and reset.
+    px.set_cam_pan_angle(0)
+    px.set_cam_tilt_angle(CAM_TILT_ANGLE)   # look down at the floor in front
+
     state = JunctionState()
     stop_event = threading.Event()
     worker = threading.Thread(target=vision_worker, args=(state, stop_event),
