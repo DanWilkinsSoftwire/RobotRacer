@@ -2,28 +2,29 @@
 """Route runner — follow the line, execute a PREDEFINED turn at each junction.
 
 Detection (robust to this maze's varying / low-contrast surface):
-    AdaptiveLine decides "on tape" from real-time contrast, not a fixed
-    threshold. A junction is detected when BOTH outer sensors read tape at once
-    (a + / T crossbar -> [T,T,T]; a Y / fork -> [T,F,T]). Normal line-following
-    never lights both outer sensors at once, so this is a clean junction signal.
+    AdaptiveLine decides "on tape" from real-time contrast, anchored to the
+    consistent tape level (~1000). A junction is detected when BOTH outer sensors
+    read tape at once (a + / T crossbar -> [T,T,T]; a Y / fork -> [T,F,T]),
+    debounced over a few frames. Normal following never lights both outer sensors.
 
 Choice:
-    ROUTE (route.py) is an ordered list of actions, one consumed per junction.
-    We just COUNT junctions — the Nth junction runs ROUTE[N]. No type checking.
+    ROUTE (route.py) or a route-string arg is an ordered list of actions, one
+    consumed per junction (counted, no type checking).
 
-Turns use a PIVOT (tank-turn): the rear motors are independent, so we spin the
-robot roughly in place (rear wheels opposite + front wheels steered into the
-turn) until the new branch is centred under the sensors. Tighter and more
-reliable for 90 degrees than an Ackermann arc, and it makes U-turns possible.
+Turns use a PIVOT (tank-turn) with the independent rear motors, closed-loop on
+line reacquisition. Supports left/right/straight/uturn/stop.
 
 Run it (claim the robot!):
     ./deploy.sh run experimentation/route_runner.py LLFRLF
-    # L=left  R=right  F=forward(straight)  U=uturn  S=stop
-    # omit the string to use ROUTE in route.py
-    Ctrl+C to stop. Motors stop on exit.
+    # L=left  R=right  F=forward(straight)  U=uturn  S=stop; omit to use route.py
 
-No camera here — pure grayscale, so it can run alongside grayscale_server.py
-(open http://<robot-ip>:9001/ to watch the sensors while it drives).
+Diagnose detection WITHOUT driving (hand-move the robot over the tape/junctions):
+    ./deploy.sh run experimentation/route_runner.py --dry-run
+
+Log a real run (per-cycle) to stdout and/or a CSV you can send back:
+    ./deploy.sh run experimentation/route_runner.py FRLF --debug --log run.csv
+
+No camera — pure grayscale, so it can run alongside grayscale_server.py.
 """
 
 import argparse
@@ -47,18 +48,17 @@ DRIVE_POWER = CONFIG["drive_power"]
 STEER_OFFSET = CONFIG["steer_offset"]       # gentle correction while following
 TURN_ANGLE = 30             # front-wheel steer into a pivot ([-30,30], + = left)
 PIVOT_POWER = CONFIG.get("pivot_power", DRIVE_POWER)
-CREEP_S = 0.15              # creep forward this long before pivoting, to centre the
-                           # wheelbase over the junction (sensors sit ahead of the
-                           # rear pivot axis). Set 0 to disable.
+CREEP_S = 0.15             # creep forward this long before pivoting, to centre the
+                           # wheelbase over the junction. Set 0 to disable.
 MIN_TURN_S = 0.4           # ignore line reacquisition before this (skip the crossbar we're on)
 MAX_TURN_S = 2.5           # bail out of a 90-degree pivot after this
 MIN_UTURN_S = 1.2          # a 180 takes longer; don't finish early
 MAX_UTURN_S = 4.0
 COOLDOWN_S = 1.0           # after handling a junction, ignore junctions briefly
-                           # (also carries a "straight" across the crossbar)
 SEED_S = 0.5               # sit still this long at startup to seed the floor estimate
 JUNCTION_FRAMES = 3        # require both-outer-on-tape for this many consecutive
                            # cycles before acting — debounces single-frame glitches
+LOG_EVERY = 5              # with --debug, log every Nth control cycle (~10 Hz at 50 Hz)
 
 # Single-letter route actions, e.g. "LLFRLF".
 ACTION_BY_CHAR = {
@@ -73,8 +73,7 @@ ACTION_BY_CHAR = {
 def parse_route(s):
     """Parse a route string like "LLFRLF" -> ["left","left","straight",...].
 
-    Case-insensitive; spaces, commas, dashes and underscores are ignored as
-    separators so "LL F R-L F" also works.
+    Case-insensitive; spaces, commas, dashes and underscores are ignored.
     """
     actions = []
     for ch in s:
@@ -87,22 +86,75 @@ def parse_route(s):
     return actions
 
 
-def pivot(px, direction, power):
+def bits(on_tape):
+    return "".join("T" if b else "F" for b in on_tape)
+
+
+class Logger:
+    """Print log lines and (optionally) tee them to a file."""
+
+    def __init__(self, path=None):
+        self.f = open(path, "w") if path else None
+        if self.f:
+            self.f.write("# t,data,floor,thr,on,mode,steer,junction_frames,note\n")
+
+    def line(self, msg):
+        print(msg, flush=True)
+
+    def row(self, t, data, floor, thr, on_tape, mode, steer, jf, note=""):
+        msg = ("[%6.2f] data=%s floor=%4.0f thr=%4.0f on=%s mode=%-6s steer=%+d jf=%d %s"
+               % (t, data, floor, thr, bits(on_tape), mode, steer, jf, note))
+        print(msg, flush=True)
+        if self.f:
+            self.f.write("%.3f,%s,%.0f,%.0f,%s,%s,%d,%d,%s\n"
+                         % (t, "|".join(map(str, data)), floor, thr,
+                            bits(on_tape), mode, steer, jf, note))
+            self.f.flush()
+
+    def close(self):
+        if self.f:
+            self.f.close()
+
+
+class Motors:
+    """Thin actuation wrapper so --dry-run can disable all movement."""
+
+    def __init__(self, px, enabled):
+        self.px = px
+        self.enabled = enabled
+
+    def forward(self, speed):
+        if self.enabled:
+            self.px.forward(speed)
+
+    def stop(self):
+        if self.enabled:
+            self.px.stop()
+
+    def set_dir_servo_angle(self, angle):
+        if self.enabled:
+            self.px.set_dir_servo_angle(angle)
+
+    def set_motor_speed(self, motor, speed):
+        if self.enabled:
+            self.px.set_motor_speed(motor, speed)
+
+
+def pivot(mot, direction, power):
     """direction: +1 = left (CCW), -1 = right (CW). Rear-wheel tank-turn in place.
 
-    Signs follow picarx forward() = (motor1:+, motor2:-). So:
-        left  (CCW) = right wheel fwd + left wheel back = both motors negative
-        right (CW)  = left wheel fwd + right wheel back = both motors positive
-    If your robot pivots the WRONG way, swap the two motor signs below (a motor
-    calibration / wiring difference).
+    Signs follow picarx forward() = (motor1:+, motor2:-):
+        left  (CCW) = both motors negative
+        right (CW)  = both motors positive
+    If your robot pivots the WRONG way, swap the two motor signs below.
     """
-    px.set_dir_servo_angle(direction * TURN_ANGLE)   # front wheels into the turn
+    mot.set_dir_servo_angle(direction * TURN_ANGLE)   # front wheels into the turn
     if direction > 0:        # left
-        px.set_motor_speed(1, -power)
-        px.set_motor_speed(2, -power)
+        mot.set_motor_speed(1, -power)
+        mot.set_motor_speed(2, -power)
     else:                    # right
-        px.set_motor_speed(1, power)
-        px.set_motor_speed(2, power)
+        mot.set_motor_speed(1, power)
+        mot.set_motor_speed(2, power)
 
 
 def follow_steer(on_tape, last_steer):
@@ -119,6 +171,40 @@ def follow_steer(on_tape, last_steer):
     return 0                           # ambiguous (e.g. on a crossbar) -> straight
 
 
+def seed_floor(px, detector, log):
+    log.line("Seeding floor (hold still)...")
+    seed = []
+    t0 = monotonic()
+    while monotonic() - t0 < SEED_S:
+        seed.append(px.get_grayscale_data())
+        sleep(0.02)
+    detector.seed_floor(seed)
+    log.line("  samples=%s" % seed[:3] + (" ..." if len(seed) > 3 else ""))
+    log.line("  floor=%s  threshold=%.0f  (tape~%.0f)"
+             % (None if detector.floor is None else round(detector.floor),
+                detector.threshold(), detector.tape_level))
+
+
+def dry_run(px, detector, log):
+    """Read + log detection forever, no motors. Hand-move the robot to diagnose."""
+    log.line("\nDRY RUN: no motors. Move the robot over tape / junctions; Ctrl+C to stop.\n")
+    t0 = monotonic()
+    last = None
+    try:
+        while True:
+            data = px.get_grayscale_data()
+            on_tape, thr, floor = detector.update(data)
+            junction = on_tape[0] and on_tape[2]
+            note = "JUNCTION" if junction else ("LOST" if not any(on_tape) else "")
+            # log every cycle on change, plus a heartbeat
+            if on_tape != last:
+                log.row(monotonic() - t0, data, floor, thr, on_tape, "dry", 0, 0, note)
+                last = on_tape
+            sleep(0.05)
+    except KeyboardInterrupt:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="PiCar-X predefined-route maze runner")
@@ -126,8 +212,16 @@ def main():
         "route", nargs="?", default=None,
         help="route string, e.g. LLFRLF (L=left R=right F=forward U=uturn "
              "S=stop). Omit to use ROUTE in route.py")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="read + log sensors only, no movement (hand-move to diagnose)")
+    parser.add_argument("--debug", action="store_true",
+                        help="log every control cycle")
+    parser.add_argument("--log", metavar="PATH", default=None,
+                        help="also write per-cycle CSV to this file")
     args = parser.parse_args()
+
     route = parse_route(args.route) if args.route else list(ROUTE)
+    log = Logger(args.log)
 
     px = Picarx()
     detector = AdaptiveLine(
@@ -135,20 +229,18 @@ def main():
         frac=CONFIG.get("adaptive_frac", 0.5),
         min_contrast=CONFIG.get("adaptive_min_contrast", 40),
     )
+    log.line("config: drive_power=%s steer_offset=%s tape_level=%s frac=%s min_contrast=%s"
+             % (DRIVE_POWER, STEER_OFFSET, detector.tape_level, detector.frac,
+                detector.min_contrast))
 
-    # Seed the floor by sampling for a moment while stationary. The off-line
-    # sensors supply the background, so the threshold is right before we move.
-    print("Seeding floor (hold still)...")
-    seed = []
-    t0 = monotonic()
-    while monotonic() - t0 < SEED_S:
-        seed.append(px.get_grayscale_data())
-        sleep(0.02)
-    detector.seed_floor(seed)
-    print("  floor=%s  threshold=%.0f  (tape~%.0f)"
-          % (None if detector.floor is None else round(detector.floor),
-             detector.threshold(), detector.tape_level))
+    seed_floor(px, detector, log)
 
+    if args.dry_run:
+        dry_run(px, detector, log)
+        log.close()
+        return
+
+    mot = Motors(px, enabled=True)
     period = 1.0 / FOLLOW_HZ
     mode = "follow"            # "follow" | "turn"
     turn_dir = 1
@@ -158,13 +250,16 @@ def main():
     cooldown_until = 0.0
     junction_frames = 0       # consecutive both-outer-on-tape cycles (debounce)
     j = 0                     # next ROUTE index (also the junction count)
+    cycle = 0
+    t_start = monotonic()
 
-    print("Route runner: %d planned junctions %s. Ctrl+C to stop.\n"
-          % (len(route), route))
+    log.line("Route runner: %d planned junctions %s. Ctrl+C to stop.\n"
+             % (len(route), route))
     try:
-        px.forward(DRIVE_POWER)
+        mot.forward(DRIVE_POWER)
         while True:
             now = monotonic()
+            cycle += 1
             data = px.get_grayscale_data()
             on_tape, thr, floor = detector.update(data)
 
@@ -173,35 +268,35 @@ def main():
                 if junction_frames >= JUNCTION_FRAMES and now >= cooldown_until:
                     junction_frames = 0
                     action = route[j] if j < len(route) else "stop"
-                    print("-> junction %d: %-8s data=%s on=%s thr=%.0f floor=%.0f"
-                          % (j, action, data, on_tape, thr, floor))
+                    log.line("-> junction %d: %-8s data=%s on=%s thr=%.0f floor=%.0f"
+                             % (j, action, data, bits(on_tape), thr, floor))
                     j += 1
 
                     if action == "stop":
                         break
                     elif action == "straight":
-                        px.set_dir_servo_angle(0)
-                        px.forward(DRIVE_POWER)
+                        mot.set_dir_servo_angle(0)
+                        mot.forward(DRIVE_POWER)
                         last_steer = 0
                         cooldown_until = now + COOLDOWN_S   # carry across the crossbar
                     elif action in ("left", "right", "uturn"):
                         if CREEP_S > 0:                     # centre over the junction first
-                            px.set_dir_servo_angle(0)
-                            px.forward(DRIVE_POWER)
+                            mot.set_dir_servo_angle(0)
+                            mot.forward(DRIVE_POWER)
                             sleep(CREEP_S)
                         mode = "turn"
                         turn_is_uturn = (action == "uturn")
                         turn_dir = -1 if action == "right" else 1   # uturn pivots left
                         turn_start = monotonic()
-                        pivot(px, turn_dir, PIVOT_POWER)
+                        pivot(mot, turn_dir, PIVOT_POWER)
                     else:
-                        print("   unknown action %r -> treating as straight" % action)
+                        log.line("   unknown action %r -> treating as straight" % action)
                         cooldown_until = now + COOLDOWN_S
                 else:
                     steer = follow_steer(on_tape, last_steer)
                     last_steer = steer
-                    px.set_dir_servo_angle(steer)
-                    px.forward(DRIVE_POWER)
+                    mot.set_dir_servo_angle(steer)
+                    mot.forward(DRIVE_POWER)
 
             elif mode == "turn":
                 elapsed = now - turn_start
@@ -213,18 +308,23 @@ def main():
                     mode = "follow"
                     last_steer = 0
                     cooldown_until = monotonic() + COOLDOWN_S
-                    px.set_dir_servo_angle(0)
-                    px.forward(DRIVE_POWER)
-                    print("   turn %s after %.1fs"
-                          % ("complete" if reacquired else "TIMED OUT", elapsed))
+                    mot.set_dir_servo_angle(0)
+                    mot.forward(DRIVE_POWER)
+                    log.line("   turn %s after %.1fs"
+                             % ("complete" if reacquired else "TIMED OUT", elapsed))
                 # else: keep pivoting (already commanded)
+
+            if args.debug and cycle % LOG_EVERY == 0:
+                log.row(now - t_start, data, floor, thr, on_tape, mode,
+                        last_steer, junction_frames)
 
             sleep(period)
     except KeyboardInterrupt:
         pass
     finally:
-        px.stop()
-        print("\nstopped after %d junction(s)" % j)
+        mot.stop()
+        log.line("\nstopped after %d junction(s)" % j)
+        log.close()
 
 
 if __name__ == "__main__":
