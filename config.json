@@ -6,5 +6,12 @@
     895
   ],
   "drive_power": 10,
-  "steer_offset": 20
+  "steer_offset": 20,
+  "grayscale_min": [302, 285, 422],
+  "grayscale_max": [913, 775, 968],
+  "pid_kp": 40.0,
+  "pid_ki": 0.0,
+  "pid_kd": 5.0,
+  "base_speed": 10,
+  "speed_scale": 0.5
 }
