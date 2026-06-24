@@ -22,14 +22,29 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from picarx import Picarx
 from vilib import Vilib
 
-from config import CONFIG
+import config
 from junction_detector import JunctionState, vision_worker
 from maze_map import MazeMap
 
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+
+# Live config helper
+_cfg = config.load()
+_cfg_mtime = os.stat(CONFIG_PATH).st_mtime_ns
+
+def live_config():
+    global _cfg, _cfg_mtime
+    try:
+        m = os.stat(CONFIG_PATH).st_mtime_ns
+        if m != _cfg_mtime:
+            _cfg_mtime = m
+            _cfg = config.load()
+    except Exception:
+        pass
+    return _cfg
+
 # --- Tuning knobs ------------------------------------------------------------
 FOLLOW_HZ = 50                 # control loop rate
-DRIVE_POWER = CONFIG["drive_power"]
-STEER_OFFSET = CONFIG["steer_offset"]   # gentle correction while following
 TURN_ANGLE = 30                # sharp steer for a committed junction turn ([-30,30], + = left)
 MIN_TURN_S = 0.4               # don't declare the turn "done" before this
 MAX_TURN_S = 2.5               # give up turning after this (avoid spinning forever)
@@ -51,15 +66,15 @@ def read_on_tape(px, reference):
     data = px.get_grayscale_data()
     return [v > r for v, r in zip(data, reference)], data
 
-def follow_steer(on_tape, last_steer):
+def follow_steer(on_tape, last_steer, offset):
     """Steering angle for normal line-following from the on-tape booleans."""
     left, mid, right = on_tape
     if mid and not left and not right:
         return 0                       # centred
     if left and not right:
-        return STEER_OFFSET            # tape to the left -> steer left
+        return offset            # tape to the left -> steer left
     if right and not left:
-        return -STEER_OFFSET           # tape to the right -> steer right
+        return -offset           # tape to the right -> steer right
     if not any(on_tape):
         return last_steer              # lost the line -> keep last correction (recovery)
     return 0                           # ambiguous -> hold straight
@@ -71,7 +86,8 @@ def main():
     args = parser.parse_args()
 
     px = Picarx()
-    reference = CONFIG["line_reference"]
+    cfg = live_config()
+    reference = cfg["line_reference"]
     px.set_line_reference(reference)
 
     # Initialize or load map
@@ -138,22 +154,28 @@ def main():
 
     print(f"Mapped Maze Runner started. Saving to '{args.map}'. Ctrl+C to stop.\n")
     try:
-        px.forward(DRIVE_POWER)
+        cfg = live_config()
+        px.forward(cfg["drive_power"])
         while True:
             now = monotonic()
             dt = now - last_time
             last_time = now
 
+            cfg = live_config()
+            power = cfg["drive_power"]
+            offset = cfg["steer_offset"]
+            reference = cfg["line_reference"]
+
             on_tape, raw = read_on_tape(px, reference)
             js = state.snapshot()
 
             # --- Dead Reckoning Integration ---
-            # Power is DRIVE_POWER, so speed is SPEED_M_S
+            # Power is power, so speed is SPEED_M_S
             # Adjust speed based on whether we are moving
             current_speed = SPEED_M_S if mode != "stop" else 0.0
             
             if mode == "follow":
-                steer = follow_steer(on_tape, last_steer)
+                steer = follow_steer(on_tape, last_steer, offset)
                 last_steer = steer
                 
                 # Estimate yaw change based on steering correction
@@ -163,7 +185,7 @@ def main():
                 y += current_speed * math.cos(theta) * dt
                 
                 px.set_dir_servo_angle(steer)
-                px.forward(DRIVE_POWER)
+                px.forward(power)
 
                 # Check for junction detection
                 junction_left = (js["label"] in JUNCTION_LABELS and on_tape[0])
@@ -191,7 +213,7 @@ def main():
                     mode = "turn_left"
                     turn_start = now
                     px.set_dir_servo_angle(TURN_ANGLE)
-                    px.forward(DRIVE_POWER)
+                    px.forward(power)
 
             elif mode == "turn_left":
                 # Turning left decreases theta (heading turns to West/counter-clockwise)
