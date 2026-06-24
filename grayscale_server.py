@@ -87,6 +87,8 @@ DASHBOARD_HTML = """<!doctype html>
   .meta { margin-top:20px; color:#aaa; font-size:.9rem; line-height:1.7; }
   .meta b { color:#eee; }
   code { color:#9cdcfe; }
+  button { background:#333; color:#eee; border:1px solid #555; border-radius:4px;
+           padding:2px 8px; cursor:pointer; font-size:.85rem; }
 </style></head>
 <body>
   <h1>PiCar-X grayscale debug</h1>
@@ -103,10 +105,16 @@ DASHBOARD_HTML = """<!doctype html>
     <div>Reference: <code id="ref">--</code>
       (green = over threshold &rarr; white tape)</div>
     <div>Tape detected under: <b id="tape">--</b></div>
+    <div>Bar scale (auto): <code id="scale">--</code>
+      <button id="reset">reset</button></div>
     <div id="err" style="color:#ff5277"></div>
   </div>
 <script>
-  const ADC_MAX = %ADC_MAX%;
+  // Auto-scale: stretch the bars to the range of values + references we've seen
+  // (with a little padding) so threshold crossings are big, obvious movements.
+  let lo = null, hi = null;
+  document.getElementById('reset').onclick = () => { lo = hi = null; };
+
   async function poll() {
     try {
       const r = await fetch('/grayscale', {cache:'no-store'});
@@ -114,24 +122,34 @@ DASHBOARD_HTML = """<!doctype html>
       const err = document.getElementById('err');
       if (d.error) { err.textContent = 'sensor error: ' + d.error; return; }
       err.textContent = '';
+
+      const pts = d.data.concat(d.reference);
+      lo = (lo === null) ? Math.min(...pts) : Math.min(lo, ...pts);
+      hi = (hi === null) ? Math.max(...pts) : Math.max(hi, ...pts);
+      const pad = Math.max(1, (hi - lo) * 0.05);
+      const LO = lo - pad, HI = hi + pad;
+      const scale = v => Math.max(0, Math.min(100, 100 * (v - LO) / (HI - LO)));
+
       for (let i = 0; i < 3; i++) {
         const v = d.data[i], ref = d.reference[i], over = d.over_reference[i];
         const fill = document.getElementById('f' + i);
-        fill.style.width = Math.min(100, 100 * v / ADC_MAX) + '%';
+        fill.style.width = scale(v) + '%';
         fill.className = 'fill ' + (over ? 'over' : 'under');
-        document.getElementById('r' + i).style.left = (100 * ref / ADC_MAX) + '%';
+        document.getElementById('r' + i).style.left = scale(ref) + '%';
         document.getElementById('v' + i).textContent = v;
       }
       document.getElementById('ref').textContent = '[' + d.reference.join(', ') + ']';
       document.getElementById('tape').textContent =
           d.tape.length ? d.tape.join(', ') : 'none';
+      document.getElementById('scale').textContent =
+          Math.round(LO) + ' – ' + Math.round(HI);
     } catch (e) { /* keep polling */ }
   }
   setInterval(poll, 120);
   poll();
 </script>
 </body></html>
-""".replace("%ADC_MAX%", str(ADC_MAX))
+"""
 
 
 if __name__ == "__main__":
