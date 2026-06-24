@@ -125,7 +125,7 @@ def main():
             # Verbose status reporting
             print(f"Raw: {raw} | Norm: [{L:.2f}, {M:.2f}, {R:.2f}] | Error: {error:+.3f} | Steer: {steer_angle:+.1f}° | Speed: {speed}", end="\r", flush=True)
             
-            sleep(period)
+            time.sleep(period)
             
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt: stopping and exiting.")
