@@ -42,7 +42,7 @@ if your tree is dirty), so the robot never runs anything that isn't in git.
 git pull                            # get teammates' changes first
 # ... edit code locally ...
 git commit -am "tune steer offset"  # commit your change (even WIP)
-./deploy.sh run 6.line_tracking.py  # push branch, robot checks it out, then runs it
+./deploy.sh run examples/6.line_tracking.py  # push branch, robot checks it out, then runs it
 ```
 
 `./deploy.sh` (no args) pushes + syncs the robot without running anything.
