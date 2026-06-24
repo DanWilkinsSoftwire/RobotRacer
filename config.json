@@ -1,6 +1,10 @@
 {
   "_comment": "Calibration for OUR robot on OUR maze floor. Committed on purpose: one robot, one floor, so everyone shares the dialed-in values. Tune it, commit it, push it.",
-  "line_reference": [607, 530, 695],
+  "line_reference": [
+    807,
+    730,
+    895
+  ],
   "drive_power": 10,
   "steer_offset": 20
 }
